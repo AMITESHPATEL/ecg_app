@@ -45,6 +45,11 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 from datasets import load_from_disk
+from azure_sync import (
+    download_blob_from_azure,
+    get_container_client,
+    upload_blob_to_azure,
+)
 
 # --------------------------------------------------------------------------
 # Constants
@@ -299,16 +304,14 @@ def build_ecg_figure(signal: np.ndarray, fs: float, dataset_name: str, record: s
     return fig
 
 
-def render_meta_line(idx: int, total: int, row: dict, gt_labels: list[str]) -> str:
-    """Single-line metadata bar: sample counter, dataset, record, HR, ground truth."""
+def render_meta_line(idx: int, total: int, row: dict) -> str:
+    """Single-line metadata bar: sample counter, dataset, record, HR (ground truth hidden for blind review)."""
     hr = row.get("HR", "?")
-    gt_text = ", ".join(gt_labels) if gt_labels else "—"
     fields = [
         f"<b>Sample</b> {idx + 1} / {total}",
         f"<b>Dataset:</b> {row.get('dataset', '')}",
         f"<b>Record:</b> {row.get('record', '')}",
         f"<b>Heart Rate:</b> {hr} bpm",
-        f"<b>Ground Truth:</b> {gt_text}",
     ]
     items = "".join(f'<span style="white-space:nowrap;">{f}</span>' for f in fields)
     return (
@@ -353,6 +356,20 @@ data_dir.mkdir(parents=True, exist_ok=True)
 csv_path = data_dir / "annotations.csv"
 state_path = data_dir / "state.json"
 
+# Initialize Azure Blob Storage container client
+if "azure_client" not in st.session_state:
+    st.session_state.azure_client = get_container_client()
+
+# On startup, download existing annotations.csv from Azure Blob Storage if available
+if "azure_initialized" not in st.session_state:
+    st.session_state.azure_initialized = True
+    if st.session_state.azure_client:
+        downloaded = download_blob_from_azure(
+            st.session_state.azure_client, "annotations.csv", csv_path
+        )
+        if not downloaded and csv_path.exists():
+            upload_blob_to_azure(st.session_state.azure_client, csv_path, "annotations.csv")
+
 if "df" not in st.session_state:
     st.session_state.df = init_annotations(dataset, csv_path)
 
@@ -362,13 +379,27 @@ if "idx" not in st.session_state:
     if start_idx is None or not (0 <= start_idx < total):
         start_idx = first_unreviewed_index(st.session_state.df)
     st.session_state.idx = start_idx
+    st.session_state.jump_sample_input = start_idx + 1
+
+if "jump_sample_input" not in st.session_state:
+    st.session_state.jump_sample_input = st.session_state.idx + 1
 
 df = st.session_state.df
 idx = st.session_state.idx
 
 
+def sync_to_azure(local_csv: Path) -> None:
+    """Helper to sync local annotations.csv to Azure Blob Storage if configured."""
+    client = st.session_state.get("azure_client")
+    if client:
+        try:
+            upload_blob_to_azure(client, local_csv, "annotations.csv")
+        except Exception:
+            pass
+
+
 def persist_sample(sample_idx: int) -> None:
-    """Write the current widget state for `sample_idx` into df and save to disk."""
+    """Write the current widget state for `sample_idx` into df, save to disk, and sync to Azure."""
     df = st.session_state.df
     mask = df["sample_index"] == sample_idx
     checked = [
@@ -383,93 +414,48 @@ def persist_sample(sample_idx: int) -> None:
     df.loc[mask, "annotated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     save_annotations(df, csv_path)
     save_state(state_path, sample_idx)
+    sync_to_azure(csv_path)
+
+
+def on_jump_change() -> None:
+    val = st.session_state.get("jump_sample_input", st.session_state.idx + 1)
+    persist_sample(st.session_state.idx)
+    target_idx = max(0, min(int(val) - 1, total - 1))
+    st.session_state.idx = target_idx
+    st.session_state.jump_sample_input = target_idx + 1
+    save_state(state_path, target_idx)
 
 
 def go_to(offset: int) -> None:
     persist_sample(st.session_state.idx)  # save whatever is on screen before leaving it
-    st.session_state.idx = min(max(st.session_state.idx + offset, 0), total - 1)
-    save_state(state_path, st.session_state.idx)
+    new_idx = min(max(st.session_state.idx + offset, 0), total - 1)
+    st.session_state.idx = new_idx
+    st.session_state.jump_sample_input = new_idx + 1
+    save_state(state_path, new_idx)
 
 
 # -- Sidebar ----------------------------------------------------------------
 
 with st.sidebar:
     st.subheader("Navigation")
-    jump_to = st.number_input(
-        "Jump to sample #", min_value=1, max_value=total, value=idx + 1, step=1
+    st.number_input(
+        "Jump to sample #",
+        min_value=1,
+        max_value=total,
+        key="jump_sample_input",
+        on_change=on_jump_change,
+        step=1,
     )
     if st.button("Go", use_container_width=True):
-        persist_sample(st.session_state.idx)
-        st.session_state.idx = int(jump_to) - 1
-        save_state(state_path, st.session_state.idx)
+        on_jump_change()
         st.rerun()
 
     st.divider()
-    st.subheader("Backup & restore")
-    st.caption(
-        "Storage on most free hosts is temporary and resets when the app "
-        "restarts or goes to sleep. Download a backup before you stop "
-        "working, and restore it here next time you open a new session."
-    )
+    if st.session_state.get("azure_client"):
+        st.caption("☁ **Azure Blob Storage:** Connected & autosyncing")
+    else:
+        st.caption("💾 **Storage:** Local cache mode")
 
-    current_csv_bytes = st.session_state.df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇ Download annotations.csv",
-        data=current_csv_bytes,
-        file_name="annotations.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-    restore_file = st.file_uploader(
-        "Restore from a previous annotations.csv", type=["csv"], key="restore_uploader"
-    )
-    if restore_file is not None:
-        try:
-            restored_df = pd.read_csv(restore_file)
-        except Exception as exc:  # malformed upload
-            st.error(f"Couldn't read that file: {exc}")
-            restored_df = None
-
-        if restored_df is not None:
-            missing_cols = set(CSV_COLUMNS) - set(restored_df.columns)
-            if missing_cols:
-                st.error(
-                    f"That file is missing expected columns ({', '.join(sorted(missing_cols))}) "
-                    "-- doesn't look like an annotations.csv from this app. Restore skipped."
-                )
-            elif len(restored_df) != total:
-                st.error(
-                    f"That file has {len(restored_df)} rows but this dataset has "
-                    f"{total} samples -- looks like it's from a different dataset. "
-                    "Restore skipped."
-                )
-            else:
-                restored_df["reviewed"] = restored_df["reviewed"].astype(bool)
-                for label in DOCTOR_LABELS:
-                    restored_df[f"doctor_{label}"] = restored_df[f"doctor_{label}"].astype(bool)
-                restored_df["comments"] = restored_df["comments"].fillna("").astype(str)
-
-                st.session_state.df = restored_df
-                save_annotations(restored_df, csv_path)
-
-                # Drop cached per-sample widget values so checkboxes/comments
-                # re-read from the restored data instead of showing whatever
-                # was in this browser session before the restore.
-                for key in list(st.session_state.keys()):
-                    if key.startswith("chk_") or key.startswith("comment_"):
-                        del st.session_state[key]
-
-                resume_idx = first_unreviewed_index(restored_df)
-                st.session_state.idx = resume_idx
-                save_state(state_path, resume_idx)
-
-                st.success(
-                    f"Restored {len(restored_df)} rows. Resuming at sample {resume_idx + 1}."
-                )
-                st.rerun()
-
-    st.divider()
     st.caption(f"Annotations file: `{csv_path}`")
     st.caption(f"Resume state file: `{state_path}`")
     shortcuts_enabled = st.toggle("Enable keyboard shortcuts (experimental)", value=True)
@@ -481,7 +467,7 @@ signal = np.asarray(row["II"], dtype=float)
 fs = float(row.get("fs", 500) or 500)
 
 st.markdown(
-    render_meta_line(idx, total, row, ground_truth_labels(row)), unsafe_allow_html=True
+    render_meta_line(idx, total, row), unsafe_allow_html=True
 )
 
 fig = build_ecg_figure(signal, fs, row.get("dataset", ""), row.get("record", ""))
@@ -518,12 +504,12 @@ with col_comments:
 
 nav_prev, nav_progress, nav_next = st.columns([1, 4, 1])
 with nav_prev:
-    st.button("◀ Previous", on_click=go_to, args=(-1,), use_container_width=True)
+    st.button("◀ Previous", on_click=go_to, args=(-1,), disabled=(idx <= 0), use_container_width=True)
 with nav_progress:
     reviewed = int(df["reviewed"].astype(bool).sum())
     st.progress(reviewed / total if total else 0.0, text=render_progress_caption(df))
 with nav_next:
-    st.button("Next ▶", on_click=go_to, args=(1,), type="primary", use_container_width=True)
+    st.button("Next ▶", on_click=go_to, args=(1,), disabled=(idx >= total - 1), type="primary", use_container_width=True)
 
 if shortcuts_enabled:
     components.html(KEYBOARD_JS, height=0)

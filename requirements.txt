@@ -4,4 +4,4 @@ numpy
 pandas
 plotly
 datasets
- 
+azure-storage-blob
