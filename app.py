@@ -422,7 +422,6 @@ def on_jump_change() -> None:
     persist_sample(st.session_state.idx)
     target_idx = max(0, min(int(val) - 1, total - 1))
     st.session_state.idx = target_idx
-    st.session_state.jump_sample_input = target_idx + 1
     save_state(state_path, target_idx)
 
 
@@ -446,9 +445,7 @@ with st.sidebar:
         on_change=on_jump_change,
         step=1,
     )
-    if st.button("Go", use_container_width=True):
-        on_jump_change()
-        st.rerun()
+    st.button("Go", on_click=on_jump_change, use_container_width=True)
 
     st.divider()
     if st.session_state.get("azure_client"):
